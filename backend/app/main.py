@@ -1,15 +1,29 @@
 import secrets
 import uuid
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from zipfile import ZIP_DEFLATED, ZipFile
 from typing import Annotated
+
 from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl, Field
-from .config import API_TOKEN, CORS_ORIGINS, MAX_URLS_PER_BATCH
+from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+from pydantic import BaseModel, Field
+from rq.job import Job
+
+from .config import API_TOKEN, CORS_ORIGINS, MAX_URLS_PER_BATCH, DOWNLOAD_DIR
 from .queue import download_queue
 from .security import validate_public_url, UnsafeURL
 
 app = FastAPI(title="FrameTheivery API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=False, allow_methods=["GET","POST","DELETE"], allow_headers=["Authorization","Content-Type"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["Authorization", "Content-Type"],
+)
 
 def require_auth(authorization: Annotated[str | None, Header()] = None):
     if not API_TOKEN:
@@ -21,6 +35,17 @@ def require_auth(authorization: Annotated[str | None, Header()] = None):
 class URLBatch(BaseModel):
     urls: list[str] = Field(min_length=1)
     concurrency: int = Field(default=3, ge=1, le=5)
+
+def serialize_job(job: Job) -> dict:
+    status = job.get_status(refresh=True)
+    return {
+        "id": job.id,
+        "batch_id": job.meta.get("batch_id"),
+        "url": job.args[1] if len(job.args) > 1 else None,
+        "status": status,
+        "result": job.result if status == "finished" else None,
+        "error": str(job.exc_info)[-1200:] if status == "failed" and job.exc_info else None,
+    }
 
 @app.get("/health")
 def health():
@@ -43,29 +68,89 @@ def create_batch(payload: URLBatch):
             rejected.append({"url": url, "error": str(exc)})
     if not accepted:
         raise HTTPException(422, detail={"message": "No valid public media URLs.", "rejected": rejected})
+
+    redis = download_queue.connection
     jobs = []
     for url in accepted:
         job_id = str(uuid.uuid4())
-        job = download_queue.enqueue("app.worker.download_media", job_id, url, job_id=job_id, result_ttl=86400, failure_ttl=604800)
+        job = download_queue.enqueue(
+            "app.worker.download_media", job_id, url, job_id=job_id,
+            result_ttl=604800, failure_ttl=604800,
+        )
+        job.meta["batch_id"] = batch_id
+        job.save_meta()
+        redis.sadd("ft:all_jobs", job.id)
+        redis.sadd(f"ft:batch:{batch_id}", job.id)
         jobs.append({"id": job.id, "batch_id": batch_id, "url": url, "status": "queued"})
     return {"batch_id": batch_id, "accepted": jobs, "rejected": rejected}
 
 @app.get("/api/v1/jobs", dependencies=[Depends(require_auth)])
 def list_jobs():
-    queued = []
-    for job in download_queue.get_jobs():
-        queued.append({"id": job.id, "status": job.get_status(), "result": job.result if job.is_finished else None, "error": str(job.exc_info)[-1000:] if job.is_failed else None})
-    return {"jobs": queued}
+    redis = download_queue.connection
+    ids = redis.smembers("ft:all_jobs")
+    jobs = []
+    for raw_id in ids:
+        job_id = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+        try:
+            jobs.append(serialize_job(Job.fetch(job_id, connection=redis)))
+        except Exception:
+            redis.srem("ft:all_jobs", job_id)
+    jobs.sort(key=lambda item: item["id"], reverse=True)
+    return {"jobs": jobs}
 
 @app.get("/api/v1/jobs/{job_id}", dependencies=[Depends(require_auth)])
 def get_job(job_id: str):
-    from rq.job import Job
+    try:
+        return serialize_job(Job.fetch(job_id, connection=download_queue.connection))
+    except Exception:
+        raise HTTPException(404, "Job not found.")
+
+@app.get("/api/v1/jobs/{job_id}/file", dependencies=[Depends(require_auth)])
+def download_job_file(job_id: str):
     try:
         job = Job.fetch(job_id, connection=download_queue.connection)
     except Exception:
         raise HTTPException(404, "Job not found.")
-    return {"id": job.id, "status": job.get_status(), "result": job.result if job.is_finished else None, "error": str(job.exc_info)[-1000:] if job.is_failed else None}
+    if not job.is_finished or not job.result:
+        raise HTTPException(409, "This transfer is not complete.")
+    path = Path(job.result["path"]).resolve()
+    if DOWNLOAD_DIR.resolve() not in path.parents or not path.is_file():
+        raise HTTPException(404, "Saved media file is unavailable.")
+    return FileResponse(path, filename=job.result["filename"], media_type="application/octet-stream")
+
+@app.get("/api/v1/batches/{batch_id}/archive", dependencies=[Depends(require_auth)])
+def download_batch_archive(batch_id: str):
+    redis = download_queue.connection
+    ids = redis.smembers(f"ft:batch:{batch_id}")
+    if not ids:
+        raise HTTPException(404, "Batch not found.")
+    jobs = []
+    for raw_id in ids:
+        job_id = raw_id.decode() if isinstance(raw_id, bytes) else str(raw_id)
+        try:
+            jobs.append(Job.fetch(job_id, connection=redis))
+        except Exception:
+            continue
+    if any(not job.is_finished for job in jobs):
+        raise HTTPException(409, "Wait until every transfer in this batch has finished.")
+    export_dir = DOWNLOAD_DIR / "exports"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = export_dir / f"{batch_id}.zip"
+    with ZipFile(archive_path, "w", ZIP_DEFLATED) as archive:
+        for job in jobs:
+            result = job.result or {}
+            path = Path(result.get("path", "")).resolve()
+            if DOWNLOAD_DIR.resolve() in path.parents and path.is_file():
+                archive.write(path, arcname=result.get("filename", path.name))
+    return FileResponse(
+        archive_path, filename=f"frametheivery-{batch_id}.zip",
+        media_type="application/zip",
+    )
 
 @app.get("/api/v1/config", dependencies=[Depends(require_auth)])
 def config():
-    return {"max_urls_per_batch": MAX_URLS_PER_BATCH, "supported_sources": ["direct-http-media"], "youtube": "Import your own uploads through Google Takeout or YouTube Studio exports."}
+    return {
+        "max_urls_per_batch": MAX_URLS_PER_BATCH,
+        "supported_sources": ["direct-http-media"],
+        "youtube": "For your own uploads, import the export downloaded through Google Takeout or YouTube Studio.",
+    }
