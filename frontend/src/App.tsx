@@ -1,8 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { ArrowDownToLine, CheckCircle2, CircleAlert, Clock3, FileVideo2, Link2, LoaderCircle, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
+import { ArrowDownToLine, CheckCircle2, CircleAlert, Clock3, FileArchive, FileVideo2, Link2, LoaderCircle, RefreshCw, ShieldCheck, RotateCcw } from "lucide-react";
 
 const API = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
-type Job = { id: string; status: string; result?: { filename: string; bytes: number; sha256: string; path: string } | null; error?: string | null };
+type Job = {
+  id: string; batch_id?: string; url?: string; status: string; progress?: number | null;
+  downloaded_bytes?: number; total_bytes?: number | null; phase?: string;
+  result?: { filename: string; bytes: number; sha256: string; path: string } | null; error?: string | null
+};
 export default function App() {
   const [urls, setUrls] = useState("");
   const [token, setToken] = useState(localStorage.getItem("ft_token") || "");
@@ -14,6 +18,11 @@ export default function App() {
   const completed = jobs.filter(j => j.status === "finished").length;
   const failed = jobs.filter(j => j.status === "failed").length;
   const active = jobs.filter(j => ["queued","started","deferred"].includes(j.status)).length;
+  const batches = useMemo(() => {
+    const grouped = new Map<string, Job[]>();
+    jobs.forEach(job => { if (job.batch_id) grouped.set(job.batch_id, [...(grouped.get(job.batch_id) || []), job]); });
+    return grouped;
+  }, [jobs]);
 
   async function request(path: string, init: RequestInit = {}) {
     const response = await fetch(API + path, { ...init, headers: { "Content-Type": "application/json", Authorization: "Bearer " + token, ...(init.headers || {}) } });
@@ -23,7 +32,8 @@ export default function App() {
   }
   async function refresh() {
     if (!token) return;
-    try { const data = await request("/api/v1/jobs"); setJobs(data.jobs || []); } catch (e) { setMessage(e instanceof Error ? e.message : "Unable to refresh queue"); }
+    try { const data = await request("/api/v1/jobs"); setJobs(data.jobs || []); }
+    catch (e) { setMessage(e instanceof Error ? e.message : "Unable to refresh queue"); }
   }
   useEffect(() => { refresh(); const id = setInterval(refresh, 2500); return () => clearInterval(id); }, [token]);
   async function submit() {
@@ -37,17 +47,32 @@ export default function App() {
     } catch (e) { setMessage(e instanceof Error ? e.message : "Could not queue URLs"); }
     finally { setBusy(false); }
   }
+  async function download(path: string) {
+    try {
+      const response = await fetch(API + path, { headers: { Authorization: "Bearer " + token } });
+      if (!response.ok) throw new Error((await response.text()) || "Download failed");
+      const blob = await response.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a"); link.href = objectUrl;
+      link.download = path.includes("/archive") ? "frametheivery-batch.zip" : "media-download";
+      document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(objectUrl);
+    } catch (e) { setMessage(e instanceof Error ? e.message : "Download failed"); }
+  }
+  async function retry(jobId: string) {
+    try { await request(`/api/v1/jobs/${jobId}/retry`, { method: "POST" }); setMessage("Retry queued."); await refresh(); }
+    catch (e) { setMessage(e instanceof Error ? e.message : "Retry failed"); }
+  }
   function saveToken() { localStorage.setItem("ft_token", token); setShowToken(false); refresh(); }
-  const fmt = (n: number) => n < 1024 ? n + " B" : n < 1048576 ? (n/1024).toFixed(1)+" KB" : (n/1048576).toFixed(1)+" MB";
+  const fmt = (n: number) => n < 1024 ? n + " B" : n < 1048576 ? (n/1024).toFixed(1)+" KB" : n < 1073741824 ? (n/1048576).toFixed(1)+" MB" : (n/1073741824).toFixed(2)+" GB";
   return <main className="shell">
     <header><a className="brand" href="#"><span className="brandmark"><FileVideo2 size={20}/></span><span>frame<span className="accent">theivery</span></span></a><div className="header-right"><span className="secure"><ShieldCheck size={14}/> PRIVATE INSTANCE</span><button className="icon-button" onClick={refresh} title="Refresh queue"><RefreshCw size={17}/></button></div></header>
     <section className="hero"><div className="eyebrow">PERSONAL MEDIA TRANSFER</div><h1>Bring your media<br/><span className="muted">together.</span></h1><p>Queue direct media URLs in bulk. Let the server handle the transfers while you get on with your work.</p></section>
     <section className="composer panel">
       <div className="section-title"><div><span className="step">01</span><h2>Source URLs</h2></div><span className="count">{parsed.length} URL{parsed.length===1?"":"s"} detected</span></div>
       <textarea value={urls} onChange={e=>setUrls(e.target.value)} placeholder={"Paste one direct media URL per line…\nhttps://example.com/video.mp4\nhttps://cdn.example.com/another-video.mp4"} spellCheck={false}/>
-      <div className="composer-footer"><span>One URL per line · duplicates removed automatically</span><button className="primary" disabled={!parsed.length || busy} onClick={submit}>{busy?<LoaderCircle className="spin" size={16}/>:<ArrowDownToLine size={16}/>} Queue {parsed.length || ""} download{parsed.length===1?"":"s"}</button></div>
+      <div className="composer-footer"><span>One URL per line · duplicates removed automatically · up to 200 per batch</span><button className="primary" disabled={!parsed.length || busy} onClick={submit}>{busy?<LoaderCircle className="spin" size={16}/>:<ArrowDownToLine size={16}/>} Queue {parsed.length || ""} download{parsed.length===1?"":"s"}</button></div>
       {message && <div className="notice"><CircleAlert size={15}/>{message}</div>}
-      <div className="source-note">YouTube uploads: import your own videos via Google Takeout or YouTube Studio. This tool accepts direct media URLs and does not bypass platform download controls.</div>
+      <div className="source-note">Direct downloadable media URLs are supported. For your own YouTube uploads, use Google Takeout or YouTube Studio exports; this application does not bypass YouTube download controls.</div>
     </section>
     <section className="stats">
       <div className="stat panel"><span>IN QUEUE</span><strong>{active}</strong><small><Clock3 size={13}/> Active transfers</small></div>
@@ -55,8 +80,9 @@ export default function App() {
       <div className="stat panel"><span>FAILED</span><strong>{failed}</strong><small><CircleAlert size={13}/> Need attention</small></div>
     </section>
     <section className="queue panel"><div className="section-title"><div><span className="step">02</span><h2>Transfer queue</h2></div><button className="text-button" onClick={refresh}><RefreshCw size={14}/> Refresh</button></div>
-      {!jobs.length ? <div className="empty"><div className="empty-icon"><Link2 size={22}/></div><strong>Nothing in the queue yet</strong><span>Paste your first batch of URLs above.</span></div> : <div className="job-list">{jobs.map(job=><article className="job" key={job.id}><div className="file-icon"><FileVideo2 size={18}/></div><div className="job-info"><strong>{job.result?.filename || job.id.slice(0,8)}</strong><small>{job.result ? fmt(job.result.bytes) + " · SHA-256 " + job.result.sha256.slice(0,12) : job.error || "Transfer queued"}</small></div><span className={"status "+job.status}>{job.status}</span></article>)}</div>}
+      {!jobs.length ? <div className="empty"><div className="empty-icon"><Link2 size={22}/></div><strong>Nothing in the queue yet</strong><span>Paste your first batch of URLs above.</span></div> : <div className="job-list">{jobs.map(job=><article className="job" key={job.id}><div className="file-icon"><FileVideo2 size={18}/></div><div className="job-info"><strong>{job.result?.filename || job.url || job.id.slice(0,8)}</strong><small>{job.result ? fmt(job.result.bytes) + " · SHA-256 " + job.result.sha256.slice(0,12) : job.error || (job.phase === "connecting" ? "Connecting…" : job.downloaded_bytes ? fmt(job.downloaded_bytes) + (job.total_bytes ? " / " + fmt(job.total_bytes) : " downloaded") : "Waiting for worker")}</small>{job.status==="started" && <div className="progress"><span style={{width: (job.progress ?? 0) + "%"}}/></div>}</div><div className="job-actions"><span className={"status "+job.status}>{job.progress != null && job.status==="started" ? job.progress+"%" : job.status}</span>{job.status==="finished" && <button className="mini-button" title="Download file" onClick={()=>download(`/api/v1/jobs/${job.id}/file`)}><ArrowDownToLine size={15}/></button>}{job.status==="failed" && <button className="mini-button" title="Retry" onClick={()=>retry(job.id)}><RotateCcw size={15}/></button>}</div></article>)}</div>}
     </section>
+    {batches.size > 0 && <section className="queue panel"><div className="section-title"><div><span className="step">03</span><h2>Batch exports</h2></div></div>{[...batches.entries()].map(([id,items])=><div className="batch-row" key={id}><div><strong>{id.slice(0,8)}</strong><small>{items.length} files · {items.filter(j=>j.status==="finished").length} complete</small></div><button className="text-button" disabled={items.some(j=>j.status!=="finished")} onClick={()=>download(`/api/v1/batches/${id}/archive`)}><FileArchive size={15}/> Download ZIP</button></div>)}</section>}
     <footer><span>FRAMETHEIVERY · SELF-HOSTED MEDIA TOOL</span><span>Files stay on your server.</span></footer>
     {showToken && <div className="modal-backdrop"><div className="modal panel"><div className="eyebrow">INSTANCE AUTHENTICATION</div><h2>Connect to your server</h2><p>Enter the API token configured in your server's environment.</p><input value={token} onChange={e=>setToken(e.target.value)} placeholder="API token" type="password"/><button className="primary full" onClick={saveToken} disabled={!token}>Connect instance</button></div></div>}
   </main>;
