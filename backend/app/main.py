@@ -1,14 +1,12 @@
 import secrets
 import uuid
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 from zipfile import ZIP_DEFLATED, ZipFile
 from typing import Annotated
 
 from fastapi import FastAPI, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from rq.job import Job
 
@@ -43,6 +41,10 @@ def serialize_job(job: Job) -> dict:
         "batch_id": job.meta.get("batch_id"),
         "url": job.args[1] if len(job.args) > 1 else None,
         "status": status,
+        "progress": job.meta.get("progress"),
+        "downloaded_bytes": job.meta.get("downloaded_bytes", 0),
+        "total_bytes": job.meta.get("total_bytes"),
+        "phase": job.meta.get("phase", status),
         "result": job.result if status == "finished" else None,
         "error": str(job.exc_info)[-1200:] if status == "failed" and job.exc_info else None,
     }
@@ -105,6 +107,29 @@ def get_job(job_id: str):
     except Exception:
         raise HTTPException(404, "Job not found.")
 
+@app.post("/api/v1/jobs/{job_id}/retry", dependencies=[Depends(require_auth)])
+def retry_job(job_id: str):
+    redis = download_queue.connection
+    try:
+        original = Job.fetch(job_id, connection=redis)
+    except Exception:
+        raise HTTPException(404, "Job not found.")
+    if not original.is_failed:
+        raise HTTPException(409, "Only failed jobs can be retried.")
+    original_url = original.args[1]
+    validate_public_url(original_url)
+    batch_id = original.meta.get("batch_id") or str(uuid.uuid4())
+    new_id = str(uuid.uuid4())
+    job = download_queue.enqueue(
+        "app.worker.download_media", new_id, original_url, job_id=new_id,
+        result_ttl=604800, failure_ttl=604800,
+    )
+    job.meta["batch_id"] = batch_id
+    job.save_meta()
+    redis.sadd("ft:all_jobs", new_id)
+    redis.sadd(f"ft:batch:{batch_id}", new_id)
+    return {"id": new_id, "batch_id": batch_id, "status": "queued"}
+
 @app.get("/api/v1/jobs/{job_id}/file", dependencies=[Depends(require_auth)])
 def download_job_file(job_id: str):
     try:
@@ -131,7 +156,7 @@ def download_batch_archive(batch_id: str):
             jobs.append(Job.fetch(job_id, connection=redis))
         except Exception:
             continue
-    if any(not job.is_finished for job in jobs):
+    if not jobs or any(not job.is_finished for job in jobs):
         raise HTTPException(409, "Wait until every transfer in this batch has finished.")
     export_dir = DOWNLOAD_DIR / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -142,10 +167,7 @@ def download_batch_archive(batch_id: str):
             path = Path(result.get("path", "")).resolve()
             if DOWNLOAD_DIR.resolve() in path.parents and path.is_file():
                 archive.write(path, arcname=result.get("filename", path.name))
-    return FileResponse(
-        archive_path, filename=f"frametheivery-{batch_id}.zip",
-        media_type="application/zip",
-    )
+    return FileResponse(archive_path, filename=f"frametheivery-{batch_id}.zip", media_type="application/zip")
 
 @app.get("/api/v1/config", dependencies=[Depends(require_auth)])
 def config():
