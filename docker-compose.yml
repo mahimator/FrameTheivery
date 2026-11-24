@@ -1,19 +1,4 @@
 services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: ${POSTGRES_DB:-frametheivery}
-      POSTGRES_USER: ${POSTGRES_USER:-frametheivery}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-frametheivery}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   redis:
     image: redis:7-alpine
     command: redis-server --appendonly yes
@@ -24,28 +9,21 @@ services:
   api:
     build: ./backend
     env_file: .env
-    environment:
-      DATABASE_URL: ${DATABASE_URL}
-      REDIS_URL: ${REDIS_URL}
     volumes:
       - media_data:/data
     ports:
       - "8000:8000"
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_started
+      - redis
     restart: unless-stopped
 
   worker:
     build: ./backend
-    command: rq worker downloads --url ${REDIS_URL}
+    command: sh -c 'i=0; while [ "$$i" -lt "$${MAX_CONCURRENT_DOWNLOADS:-3}" ]; do rq worker downloads --url "$$REDIS_URL" & i=$$((i+1)); done; wait'
     env_file: .env
     volumes:
       - media_data:/data
     depends_on:
-      - api
       - redis
     restart: unless-stopped
 
@@ -61,6 +39,5 @@ services:
     restart: unless-stopped
 
 volumes:
-  postgres_data:
   redis_data:
   media_data:
