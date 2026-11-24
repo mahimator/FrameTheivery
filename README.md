@@ -1,25 +1,29 @@
 # FrameTheivery
 
-Self-hosted bulk media URL downloader and archive manager.
+Self-hosted bulk media downloader and archive manager.
 
 ## Current capabilities
-- Paste up to 200 direct HTTP(S) media URLs per batch.
+- Paste up to 200 public YouTube watch-page URLs or direct HTTP(S) media URLs per batch.
+- Extract public YouTube video streams with yt-dlp, including separate video/audio streams merged with FFmpeg when available.
 - Persistent Redis/RQ job queue with parallel workers.
 - Per-file transfer progress, status and error reporting.
 - Retry failed transfers.
 - SHA-256 checksums and file sizes.
 - Individual file downloads and batch ZIP exports.
-- URL and redirect validation, private-network destination rejection.
+- URL validation and private-network destination rejection for submitted URLs.
 - Docker Compose deployment and Netlify-compatible frontend.
 
-## Source support
-The downloader accepts direct media-file URLs, not ordinary YouTube watch-page URLs. For your own YouTube uploads, obtain an export through [Google Takeout](https://takeout.google.com/) or YouTube Studio. YouTube page URL extraction is intentionally not implemented because this service must not bypass YouTube's download controls or platform restrictions. A dedicated Takeout archive importer is a separate integration.
+## YouTube source support
+YouTube watch-page URLs are handled by yt-dlp without signing into the old channel. The video must be publicly playable to the server. Private, deleted, members-only, age-restricted or otherwise restricted videos may fail. The downloaded file is the best stream YouTube makes available to the public extractor, not necessarily the original upload master.
+
+Only use this feature for videos you own or have permission to download. Third-party downloading can conflict with YouTube's terms, so account recovery and official YouTube export tools remain the preferred recovery route when available. This project does not attempt to defeat DRM, paywalls, private-video restrictions or other access controls.
 
 ## Stack
 - React + Vite frontend
 - FastAPI API
 - Redis + RQ persistent job queue
-- Python workers using HTTPX streaming
+- Python workers using yt-dlp and HTTPX
+- FFmpeg for merging separate audio/video streams
 - Docker Compose
 
 ## Local development
@@ -43,5 +47,8 @@ Netlify hosts the frontend only. Connect this repository to a Netlify site with:
 
 Also set `CORS_ORIGINS` on the API server to the exact Netlify origin.
 
-## Important security notes
-Only download content you own or are authorized to retrieve. The service rejects localhost, private and reserved IP destinations and revalidates redirect targets. Do not expose Redis or the worker service publicly. Use HTTPS, keep the API token secret, and configure sensible storage quotas before opening the service to the internet.
+## Important operational notes
+- Keep yt-dlp updated because YouTube changes its player and extraction behaviour.
+- Configure sensible storage quotas. Video files can be large.
+- Do not expose Redis or the worker service publicly.
+- Use HTTPS and keep the API token secret.
