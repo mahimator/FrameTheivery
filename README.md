@@ -4,7 +4,7 @@ Self-hosted bulk media downloader and archive manager.
 
 ## Current capabilities
 - Paste up to 200 public YouTube watch-page URLs or direct HTTP(S) media URLs per batch.
-- Extract public YouTube video streams with yt-dlp, including separate video/audio streams merged with FFmpeg when available.
+- Extract public YouTube video streams with yt-dlp, including separate video/audio streams merged with FFmpeg.
 - Persistent Redis/RQ job queue with parallel workers.
 - Per-file transfer progress, status and error reporting.
 - Retry failed transfers.
@@ -18,12 +18,15 @@ YouTube watch-page URLs are handled by yt-dlp without signing into the old chann
 
 Only use this feature for videos you own or have permission to download. Third-party downloading can conflict with YouTube's terms, so account recovery and official YouTube export tools remain the preferred recovery route when available. This project does not attempt to defeat DRM, paywalls, private-video restrictions or other access controls.
 
+The Docker image installs FFmpeg, Deno and yt-dlp's default EJS components. Deno and EJS are important for current YouTube player challenge support. Keep yt-dlp updated as YouTube changes its player.
+
 ## Stack
 - React + Vite frontend
 - FastAPI API
 - Redis + RQ persistent job queue
 - Python workers using yt-dlp and HTTPX
 - FFmpeg for merging separate audio/video streams
+- Deno JavaScript runtime for yt-dlp's YouTube challenge support
 - Docker Compose
 
 ## Local development
@@ -48,7 +51,6 @@ Netlify hosts the frontend only. Connect this repository to a Netlify site with:
 Also set `CORS_ORIGINS` on the API server to the exact Netlify origin.
 
 ## Important operational notes
-- Keep yt-dlp updated because YouTube changes its player and extraction behaviour.
 - Configure sensible storage quotas. Video files can be large.
 - Do not expose Redis or the worker service publicly.
 - Use HTTPS and keep the API token secret.
