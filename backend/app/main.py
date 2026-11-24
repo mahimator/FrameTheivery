@@ -13,8 +13,9 @@ from rq.job import Job
 from .config import API_TOKEN, CORS_ORIGINS, MAX_URLS_PER_BATCH, DOWNLOAD_DIR
 from .queue import download_queue
 from .security import validate_public_url, UnsafeURL
+from .worker import is_youtube_url
 
-app = FastAPI(title="FrameTheivery API", version="1.0.0")
+app = FastAPI(title="FrameTheivery API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -32,7 +33,6 @@ def require_auth(authorization: Annotated[str | None, Header()] = None):
 
 class URLBatch(BaseModel):
     urls: list[str] = Field(min_length=1)
-    concurrency: int = Field(default=3, ge=1, le=5)
 
 def serialize_job(job: Job) -> dict:
     status = job.get_status(refresh=True)
@@ -40,6 +40,7 @@ def serialize_job(job: Job) -> dict:
         "id": job.id,
         "batch_id": job.meta.get("batch_id"),
         "url": job.args[1] if len(job.args) > 1 else None,
+        "source": "youtube" if len(job.args) > 1 and is_youtube_url(job.args[1]) else "direct",
         "status": status,
         "progress": job.meta.get("progress"),
         "downloaded_bytes": job.meta.get("downloaded_bytes", 0),
@@ -69,7 +70,7 @@ def create_batch(payload: URLBatch):
         except (UnsafeURL, ValueError) as exc:
             rejected.append({"url": url, "error": str(exc)})
     if not accepted:
-        raise HTTPException(422, detail={"message": "No valid public media URLs.", "rejected": rejected})
+        raise HTTPException(422, detail={"message": "No valid public URLs.", "rejected": rejected})
 
     redis = download_queue.connection
     jobs = []
@@ -83,7 +84,11 @@ def create_batch(payload: URLBatch):
         job.save_meta()
         redis.sadd("ft:all_jobs", job.id)
         redis.sadd(f"ft:batch:{batch_id}", job.id)
-        jobs.append({"id": job.id, "batch_id": batch_id, "url": url, "status": "queued"})
+        jobs.append({
+            "id": job.id, "batch_id": batch_id, "url": url,
+            "source": "youtube" if is_youtube_url(url) else "direct",
+            "status": "queued",
+        })
     return {"batch_id": batch_id, "accepted": jobs, "rejected": rejected}
 
 @app.get("/api/v1/jobs", dependencies=[Depends(require_auth)])
@@ -173,6 +178,6 @@ def download_batch_archive(batch_id: str):
 def config():
     return {
         "max_urls_per_batch": MAX_URLS_PER_BATCH,
-        "supported_sources": ["direct-http-media"],
-        "youtube": "For your own uploads, import the export downloaded through Google Takeout or YouTube Studio.",
+        "supported_sources": ["youtube-public-video", "direct-http-media"],
+        "youtube": "Public YouTube watch-page URLs are processed with yt-dlp. Only submit videos you own or are authorised to download.",
     }
